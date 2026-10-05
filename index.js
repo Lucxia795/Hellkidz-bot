@@ -227,6 +227,20 @@ async function sendLog(guild, channelEnvName, embed) {
     }
 }
 
+
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.get('/', (req, res) => {
+  res.send('Bot sorunsuz calisiyor!');
+});
+
+// Host kismina '0.0.0.0' eklemek kritik onem tasir
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Sunucu ${PORT} portunda aktif.`);
+});
+
 // --- 🏷️ SUNUCU ETİKETİ ROL SİSTEMİ ---
 const tagProcessing = new Set();
 
