@@ -230,10 +230,35 @@ function savePrivateRooms() {
 
 // 🔧 ENV öncelikli setup kanal ID'si (Render için)
 function getSetupChannelId() {
-    // Öncelik sırası: ENV > RAM > stats.json
     return process.env.SETUP_VOICE_CHANNEL_ID
         || client.setupVoiceChannelId
         || loadStats().setupVoiceChannelId;
+}
+
+// 🔧 Özel oda sahibi bulma fonksiyonu (kanal adından + kategori kontrolü)
+function findRoomOwner(guild, channel) {
+    if (!channel || !channel.isVoiceBased()) return null;
+    if (!channel.parent || channel.parent.name !== '.') return null; // Sadece "." kategorisindekiler
+
+    const username = channel.name.trim();
+    if (!username) return null;
+
+    // Tam eşleşme
+    let owner = guild.members.cache.find(m =>
+        m.user.username.toLowerCase() === username.toLowerCase() ||
+        m.user.tag.toLowerCase() === username.toLowerCase() ||
+        m.displayName.toLowerCase() === username.toLowerCase()
+    );
+
+    // Bulamazsa fuzzy match (başına/sonuna bir şey eklenmiş olabilir)
+    if (!owner) {
+        owner = guild.members.cache.find(m =>
+            channel.name.startsWith(m.user.username) ||
+            channel.name.includes(m.user.username)
+        );
+    }
+
+    return owner;
 }
 
 function parseUserId(input) {
@@ -269,7 +294,7 @@ async function checkGuildTag(member) {
             const role = member.guild.roles.cache.get(roleId);
             if (!role) {
                 if (!global.tagRoleWarned) {
-                    console.warn('⚠️ [SUNUCU ETİKETİ] GUILD_TAG_ROLE_ID ile eşleşen rol bulunamadı. Kontrol et: rol silinmiş veya ID yanlış olabilir.');
+                    console.warn('⚠️ [SUNUCU ETİKETİ] GUILD_TAG_ROLE_ID ile eşleşen rol bulunamadı.');
                     global.tagRoleWarned = true;
                     setTimeout(() => { global.tagRoleWarned = false; }, 60 * 60 * 1000);
                 }
@@ -293,7 +318,7 @@ async function checkGuildTag(member) {
             await sendLog(member.guild, 'LOG_GUILD', tagEmbed);
             console.log(`[SUNUCU ETİKETİ] ${member.user.tag} etiketi taktı, "${role.name}" rolü verildi.`);
         } catch (err) {
-            console.error('Sunucu etiketi rolü verilemedi (botun rolü, verilecek rolün üstünde mi?):', err?.message || err);
+            console.error('Sunucu etiketi rolü verilemedi:', err?.message || err);
         } finally {
             tagProcessing.delete(member.id);
         }
@@ -393,7 +418,7 @@ client.once('ready', async () => {
 
     if (process.env.GUILD_TAG_ROLE_ID) {
         if (client.user.primaryGuild === undefined) {
-            console.warn('⚠️ [SUNUCU ETİKETİ] discord.js sürümün sunucu etiketini desteklemiyor olabilir. "npm install discord.js@latest" ile güncelle.');
+            console.warn('⚠️ [SUNUCU ETİKETİ] discord.js sürümün sunucu etiketini desteklemiyor olabilir.');
         }
         scanGuildTags();
         const tagMinutes = Math.max(parseInt(process.env.GUILD_TAG_CHECK_MINUTES) || 5, 1);
@@ -430,6 +455,33 @@ client.once('ready', async () => {
         }
     } catch (err) {
         console.error('Özel odalar geri yüklenirken hata:', err);
+    }
+
+    // 🔍 TÜM SUNUCULARDA ÖZEL ODALARI TARA VE SAHİP ATA
+    for (const guild of client.guilds.cache.values()) {
+        try {
+            const channels = await guild.channels.fetch();
+            let restoredCount = 0;
+
+            for (const channel of channels.values()) {
+                if (!channel || !channel.isVoiceBased()) continue;
+                if (privateChannels.has(channel.id)) continue; // Zaten kayıtlı
+
+                const owner = findRoomOwner(guild, channel);
+                if (owner) {
+                    privateChannels.set(channel.id, owner.id);
+                    restoredCount++;
+                    console.log(`[ÖZEL ODA] Kanal "${channel.name}" sahibi atandı: ${owner.user.tag} (${owner.id})`);
+                }
+            }
+
+            if (restoredCount > 0) {
+                savePrivateRooms();
+                console.log(`[ÖZEL ODA] ${guild.name} için ${restoredCount} özel oda restore edildi.`);
+            }
+        } catch (err) {
+            console.error('Özel oda tarama hatası:', err?.message || err);
+        }
     }
 
     const autoVoiceChannelId = process.env.AUTO_VOICE_CHANNEL_ID;
@@ -770,15 +822,27 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         console.error('Ses istatistik hatası:', err);
     }
 
+    // 🔄 Kanala girildiğinde: privateChannels boşsa kanal adından sahibi bul
+    if (newState.channelId && !privateChannels.has(newState.channelId)) {
+        const channel = newState.guild.channels.cache.get(newState.channelId);
+        const owner = findRoomOwner(newState.guild, channel);
+        if (owner) {
+            privateChannels.set(channel.id, owner.id);
+            savePrivateRooms();
+            console.log(`[ÖZEL ODA] Kanal "${channel.name}" sahibi atandı: ${owner.user.tag} (${owner.id})`);
+        }
+    }
+
     const setupId = getSetupChannelId();
 
+    // Yeni oda açma
     if (setupId && newState.channelId === setupId && oldState.channelId !== setupId) {
         const member = newState.member;
         const guild = newState.guild;
 
         try {
             const createdChannel = await guild.channels.create({
-                name: `🔊 ${member.user.username}'in Odası`,
+                name: `${member.user.username}`, // 🎨 Sadece kullanıcı adı
                 type: ChannelType.GuildVoice,
                 parent: newState.channel?.parentId ?? null,
                 permissionOverwrites: [
@@ -803,6 +867,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         }
     }
 
+    // Boşalan odayı sil
     if (oldState.channelId && privateChannels.has(oldState.channelId)) {
         const channel = oldState.guild.channels.cache.get(oldState.channelId);
         if (channel && channel.members.size === 0) {
@@ -1121,8 +1186,36 @@ client.on('interactionCreate', async (interaction) => {
         if (!interaction.customId.startsWith('p_')) return;
 
         const voiceChannel = interaction.member.voice.channel;
-        if (!voiceChannel || privateChannels.get(voiceChannel.id) !== interaction.user.id) {
+        if (!voiceChannel) {
             return interaction.reply({ content: '⚠️ Yalnızca kendi özel ses odanızdayken bu paneli kullanabilirsiniz!', ephemeral: true });
+        }
+
+        // 🆕 Sahip kontrolü + otomatik algılama
+        let ownerId = privateChannels.get(voiceChannel.id);
+
+        if (!ownerId) {
+            // Sahip bilinmiyorsa kanal adından bul
+            const detectedOwner = findRoomOwner(interaction.guild, voiceChannel);
+            if (detectedOwner) {
+                ownerId = detectedOwner.id;
+                privateChannels.set(voiceChannel.id, ownerId);
+                savePrivateRooms();
+                console.log(`[ÖZEL ODA] Kanal "${voiceChannel.name}" sahibi otomatik atandı: ${detectedOwner.user.tag}`);
+            }
+        }
+
+        // 🆕 Oda sahibi değilse ama içindeyse ve ismi eşleşiyorsa sahiplenmesine izin ver
+        if (ownerId !== interaction.user.id) {
+            // Kullanıcı adı kanal adıyla eşleşiyor mu?
+            const isNameMatch = voiceChannel.name.toLowerCase() === interaction.user.username.toLowerCase();
+            if (isNameMatch && !ownerId) {
+                privateChannels.set(voiceChannel.id, interaction.user.id);
+                savePrivateRooms();
+                ownerId = interaction.user.id;
+                console.log(`[ÖZEL ODA] Kanal "${voiceChannel.name}" sahibi atandı: ${interaction.user.tag}`);
+            } else {
+                return interaction.reply({ content: '⚠️ Yalnızca kendi özel ses odanızdayken bu paneli kullanabilirsiniz!', ephemeral: true });
+            }
         }
 
         const id = interaction.customId;
@@ -1173,8 +1266,30 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isModalSubmit()) {
         const voiceChannel = interaction.member.voice.channel;
-        if (!voiceChannel || privateChannels.get(voiceChannel.id) !== interaction.user.id) {
+        if (!voiceChannel) {
             return interaction.reply({ content: '⚠️ Bu işlem için kendi özel odanızda olmalısınız.', ephemeral: true });
+        }
+
+        // 🆕 Sahip kontrolü + otomatik algılama
+        let ownerId = privateChannels.get(voiceChannel.id);
+        if (!ownerId) {
+            const detectedOwner = findRoomOwner(interaction.guild, voiceChannel);
+            if (detectedOwner) {
+                ownerId = detectedOwner.id;
+                privateChannels.set(voiceChannel.id, ownerId);
+                savePrivateRooms();
+            }
+        }
+
+        if (ownerId !== interaction.user.id) {
+            const isNameMatch = voiceChannel.name.toLowerCase() === interaction.user.username.toLowerCase();
+            if (isNameMatch && !ownerId) {
+                privateChannels.set(voiceChannel.id, interaction.user.id);
+                savePrivateRooms();
+                ownerId = interaction.user.id;
+            } else {
+                return interaction.reply({ content: '⚠️ Bu işlem için kendi özel odanızda olmalısınız.', ephemeral: true });
+            }
         }
 
         const value = interaction.fields.getTextInputValue('val');
@@ -1256,10 +1371,8 @@ client.on('interactionCreate', async (interaction) => {
 client.on('messageCreate', async (message) => {
     if (!message.content.startsWith(PREFIX) || message.author.bot || !message.guild) return;
 
-    // 🚫 Sadece "." yazıldıysa hiçbir şey yapma
     if (message.content.trim() === PREFIX) return;
 
-    // 🚫 Prefix'ten sonra komut adı yoksa veya geçersiz komutsa uyarı verme
     const withoutPrefix = message.content.slice(PREFIX.length).trim();
     const cmdName = withoutPrefix.split(/ +/)[0].toLowerCase();
 
@@ -1814,7 +1927,6 @@ client.on('messageCreate', async (message) => {
             s.setupVoiceChannelId = voiceChannel.id;
             saveStats(s);
 
-            // 📌 Render kullanıyorsan ENV'e eklemen gereken ID
             console.log(`\n=========================================`);
             console.log(`📌 [ÖZEL ODA] Yeni kurulum kanalı oluşturuldu!`);
             console.log(`   Kanal ID: ${voiceChannel.id}`);
