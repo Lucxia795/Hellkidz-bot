@@ -545,7 +545,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
     const now = Date.now();
 
-    // Ses İstatistiği Hesabı
     try {
         if (!oldState.channelId && newState.channelId) {
             voiceStates.set(userId, now);
@@ -567,14 +566,13 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
     const setupId = getSetupChannelId();
 
-    // Kurulum ses kanalına katılan üye için Özel Oda oluşturma
     if (setupId && newState.channelId === setupId && oldState.channelId !== setupId) {
         const member = newState.member;
         const guild = newState.guild;
 
         try {
             const createdChannel = await guild.channels.create({
-                name: `${member.user.username}`,
+                name: `🔊 ${member.user.username}'in Odası`,
                 type: ChannelType.GuildVoice,
                 parent: newState.channel?.parentId ?? null,
                 permissionOverwrites: [
@@ -599,7 +597,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         }
     }
 
-    // Özel oda boşaldığında silme
     if (oldState.channelId && privateChannels.has(oldState.channelId)) {
         const channel = oldState.guild.channels.cache.get(oldState.channelId);
         if (channel && channel.members.size === 0) {
@@ -612,17 +609,35 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 // --- 🕹️ INTERACTION (BUTONLAR, MODALLAR VE SLASH KOMUTLARI) ---
 client.on('interactionCreate', async (interaction) => {
-    // 1. ODA YÖNETİM BUTONLARI (PANEL TIKLAMALARI)
+    // 1. BUTON ETKİLEŞİMLERİ
     if (interaction.isButton()) {
         const { customId, member, guild, channel } = interaction;
-        
-        // Buton ID'sine göre buton eşleştirmeleri (Türkçe/İngilizce etiket toleransı)
-        const roomButtons = ['room_name', 'room_limit', 'room_lock', 'room_hide', 'room_access', 'room_kick', 'room_block', 'room_owner', 'room_delete', 'Name', 'Limit', 'Lock', 'Hide', 'Access', 'Kick', 'Block', 'Owner', 'Delete'];
+
+        // ÇEKİLİŞ KATILMA BUTONU
+        if (customId === 'cekilis_katil') {
+            const stats = loadStats();
+            const giveawayData = stats.giveaways[interaction.message.id] || { participants: [] };
+            
+            if (giveawayData.participants.includes(member.id)) {
+                return interaction.reply({ content: '⚠️ Çekilişe zaten katıldınız!', ephemeral: true });
+            }
+
+            giveawayData.participants.push(member.id);
+            stats.giveaways[interaction.message.id] = giveawayData;
+            saveStats(stats);
+
+            return interaction.reply({ content: '🎉 Çekilişe başarıyla katıldınız!', ephemeral: true });
+        }
+
+        // ÖZEL ODA KONTROL BUTONLARI (Hem ingilizce hem türkçe customId'leri kapsar)
+        const roomButtons = [
+            'room_name', 'room_limit', 'room_lock', 'room_hide', 'room_access', 'room_kick', 'room_block', 'room_owner', 'room_delete',
+            'Name', 'Limit', 'Lock', 'Hide', 'Access', 'Kick', 'Block', 'Owner', 'Delete'
+        ];
 
         if (roomButtons.includes(customId)) {
             const ownerId = privateChannels.get(channel.id);
 
-            // Yetki Kontrolü: Yalnızca oda sahibi çalıştırabilir
             if (!ownerId || ownerId !== member.id) {
                 return interaction.reply({ 
                     content: '⚠️ **Bu odayı yalnızca oda sahibi yönetebilir!**', 
@@ -630,7 +645,6 @@ client.on('interactionCreate', async (interaction) => {
                 });
             }
 
-            // ODA SİLME (Delete)
             if (customId === 'room_delete' || customId === 'Delete') {
                 await interaction.reply({ content: '🗑️ Oda siliniyor...', ephemeral: true });
                 privateChannels.delete(channel.id);
@@ -638,7 +652,6 @@ client.on('interactionCreate', async (interaction) => {
                 return channel.delete().catch(() => {});
             }
 
-            // KİLİTLE / AÇ (Lock)
             if (customId === 'room_lock' || customId === 'Lock') {
                 const everyoneRole = guild.roles.everyone;
                 const currentOverwrite = channel.permissionOverwrites.cache.get(everyoneRole.id);
@@ -654,7 +667,6 @@ client.on('interactionCreate', async (interaction) => {
                 });
             }
 
-            // GİZLE / GÖSTER (Hide)
             if (customId === 'room_hide' || customId === 'Hide') {
                 const everyoneRole = guild.roles.everyone;
                 const currentOverwrite = channel.permissionOverwrites.cache.get(everyoneRole.id);
@@ -670,7 +682,6 @@ client.on('interactionCreate', async (interaction) => {
                 });
             }
 
-            // ODA ADI DEĞİŞTİRME (Name Modal)
             if (customId === 'room_name' || customId === 'Name') {
                 const modal = new ModalBuilder()
                     .setCustomId('modal_room_name')
@@ -686,7 +697,6 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.showModal(modal);
             }
 
-            // LİMİT DEĞİŞTİRME (Limit Modal)
             if (customId === 'room_limit' || customId === 'Limit') {
                 const modal = new ModalBuilder()
                     .setCustomId('modal_room_limit')
@@ -724,11 +734,11 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
-    // 3. SLASH KOMUTLARI
+    // 3. SLASH (/) KOMUTLARI
     if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'cekilis') {
             if (!checkAuth(interaction.member)) {
-                return interaction.reply({ content: '⚠️ **Bu komut için yetkiniz yok.**', ephemeral: true });
+                return interaction.reply({ content: '⚠️ **Bu komutu kullanmak için yetkiniz bulunmamaktadır.**', ephemeral: true });
             }
 
             const reward = interaction.options.getString('odul');
