@@ -235,6 +235,20 @@ function getSetupChannelId() {
         || loadStats().setupVoiceChannelId;
 }
 
+
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+    res.send('Bot is running!');
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Web server listening on port ${PORT}`);
+});
+
+
 // 🔧 Özel oda sahibi bulma fonksiyonu (kanal adından + kategori kontrolü)
 function findRoomOwner(guild, channel) {
     if (!channel || !channel.isVoiceBased()) return null;
