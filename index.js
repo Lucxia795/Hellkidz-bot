@@ -179,6 +179,21 @@ async function loadStatsFromGitHub() {
     }
 }
 
+// ==== 🌐 WEB SUNUCUSU (Render için) ====
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+    res.send('✅ Bot çalışıyor!');
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Web sunucusu ${PORT} portunda çalışıyor.`);
+});
+// ==== 🌐 WEB SUNUCUSU SON ====
+
+
 let backupInProgress = false;
 async function saveStatsToGitHub() {
     if (!GITHUB_TOKEN || !GITHUB_REPO) return;
