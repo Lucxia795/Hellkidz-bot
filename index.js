@@ -28,6 +28,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const dns = require('dns');
+const https = require('https');
 require('dotenv').config();
 
 // ==== ENV YÜKLENDİKTEN SONRA DEBUG ====
@@ -38,6 +39,8 @@ console.log('GUILD_TAG_ROLE_ID:', process.env.GUILD_TAG_ROLE_ID || '❌ YOK');
 console.log('AUTO_VOICE_CHANNEL_ID:', process.env.AUTO_VOICE_CHANNEL_ID || '❌ YOK');
 console.log('WELCOME_CHANNEL_ID:', process.env.WELCOME_CHANNEL_ID || '❌ YOK');
 console.log('SETUP_VOICE_CHANNEL_ID:', process.env.SETUP_VOICE_CHANNEL_ID || '❌ YOK');
+console.log('GITHUB_REPO:', process.env.GITHUB_REPO || '❌ YOK');
+console.log('GITHUB_TOKEN:', process.env.GITHUB_TOKEN ? '✅ VAR' : '❌ YOK');
 console.log('===========================');
 
 // --- 🛡️ GÜVENLİK VE TOKEN SIZINTI KORUMASI ---
@@ -45,8 +48,6 @@ const TOKEN = process.env.DISCORD_TOKEN;
 
 if (!TOKEN) {
     console.error("❌ HATA: .env dosyasında DISCORD_TOKEN bulunamadı!");
-    console.error("→ .env dosyasının index.js ile AYNI klasörde olduğundan emin ol.");
-    console.error("→ Dosya adı '.env' olmalı ('.env.txt' DEĞİL).");
     process.exit(1);
 }
 
@@ -56,10 +57,10 @@ const ALLOWED_IP = process.env.ALLOWED_SERVER_IP;
 if (ALLOWED_IP) {
     dns.lookup(os.hostname(), (err, address) => {
         if (err || (address && address !== ALLOWED_IP)) {
-            console.error(`🚨 [GÜVENLİK İHLALİ] Bot yetkisiz bir IP adresinde (${address || 'Bilinmiyor'}) başlatılmaya çalışıldı! İşlem durduruluyor.`);
+            console.error(`🚨 [GÜVENLİK İHLALİ] Bot yetkisiz bir IP adresinde başlatılmaya çalışıldı!`);
             process.exit(1);
         } else {
-            console.log(`🔒 [IP DOĞRULAMA] IP adresi doğrulandı (${address}). Bot güvenli ortamda çalışıyor.`);
+            console.log(`🔒 [IP DOĞRULAMA] IP adresi doğrulandı.`);
         }
     });
 }
@@ -77,7 +78,6 @@ process.on('uncaughtException', (err) => {
     console.error('⚠️ [HATA KORUMASI] Sistem Hatası:', err?.message || err);
 });
 
-// Toplu silme yapılan kanallar (log spam'ini engellemek için)
 global.bulkDeletingChannels = new Set();
 
 const client = new Client({
@@ -94,14 +94,13 @@ const client = new Client({
 });
 
 const PREFIX = '.';
-const STATS_FILE = path.join(__dirname, 'stats.json');
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const STATS_FILE = path.join(DATA_DIR, 'stats.json');
 const callCooldowns = new Map();
 
-// 🚫 Komut kanalı spam kontrolü
 const commandSpamTracker = new Map();
 const mutedUsers = new Map();
 
-// Geçerli komutlar listesi (sadece bunlar uyarı sayılır)
 const VALID_COMMANDS = [
     'help', 'yardim',
     'temizle', 'nuke',
@@ -119,7 +118,114 @@ const VALID_COMMANDS = [
     'ban', 'kick'
 ];
 
+// ==== 📤 GITHUB OTOMATİK YEDEKLEME ====
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_REPO = process.env.GITHUB_REPO;
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
+
+function githubRequest(method, apiPath, body = null) {
+    return new Promise((resolve, reject) => {
+        const options = {
+            hostname: 'api.github.com',
+            path: apiPath,
+            method: method,
+            headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'User-Agent': 'discord-bot-backup',
+                'Accept': 'application/vnd.github.v3+json',
+                'Content-Type': 'application/json'
+            }
+        };
+
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try { resolve({ status: res.statusCode, data: JSON.parse(data || '{}') }); }
+                catch (e) { resolve({ status: res.statusCode, data }); }
+            });
+        });
+
+        req.on('error', reject);
+        if (body) req.write(JSON.stringify(body));
+        req.end();
+    });
+}
+
+async function loadStatsFromGitHub() {
+    if (!GITHUB_TOKEN || !GITHUB_REPO) {
+        console.log('[GITHUB] Token/repo tanımlı değil, yedekleme kapalı.');
+        return false;
+    }
+
+    try {
+        const res = await githubRequest('GET', `/repos/${GITHUB_REPO}/contents/stats.json?ref=${GITHUB_BRANCH}&t=${Date.now()}`);
+
+        if (res.status === 200 && res.data.content) {
+            const content = Buffer.from(res.data.content, 'base64').toString('utf-8');
+            fs.writeFileSync(STATS_FILE, content);
+            console.log(`[GITHUB] ✅ stats.json indirildi (${content.length} byte)`);
+            return true;
+        } else if (res.status === 404) {
+            console.log('[GITHUB] GitHub\'da stats.json yok, yenisi oluşturulacak.');
+            return false;
+        } else {
+            console.log(`[GITHUB] ⚠️ stats.json çekilemedi: HTTP ${res.status}`);
+            return false;
+        }
+    } catch (err) {
+        console.error('[GITHUB] Çekme hatası:', err.message);
+        return false;
+    }
+}
+
+let backupInProgress = false;
+async function saveStatsToGitHub() {
+    if (!GITHUB_TOKEN || !GITHUB_REPO) return;
+    if (backupInProgress) {
+        console.log('[GITHUB] Yedekleme zaten devam ediyor, atlanıyor.');
+        return;
+    }
+    backupInProgress = true;
+
+    try {
+        if (!fs.existsSync(STATS_FILE)) return;
+
+        const content = fs.readFileSync(STATS_FILE, 'utf-8');
+        const base64Content = Buffer.from(content).toString('base64');
+
+        let sha = null;
+        const existing = await githubRequest('GET', `/repos/${GITHUB_REPO}/contents/stats.json?ref=${GITHUB_BRANCH}`);
+        if (existing.status === 200 && existing.data.sha) sha = existing.data.sha;
+
+        const body = {
+            message: `🤖 stats backup - ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`,
+            content: base64Content,
+            branch: GITHUB_BRANCH
+        };
+        if (sha) body.sha = sha;
+
+        const res = await githubRequest('PUT', `/repos/${GITHUB_REPO}/contents/stats.json`, body);
+
+        if (res.status === 200 || res.status === 201) {
+            console.log('[GITHUB] ✅ stats.json yedeklendi.');
+        } else {
+            console.log(`[GITHUB] ⚠️ Yedekleme hatası: HTTP ${res.status} - ${JSON.stringify(res.data).slice(0, 200)}`);
+        }
+    } catch (err) {
+        console.error('[GITHUB] Yedekleme hatası:', err.message);
+    } finally {
+        backupInProgress = false;
+    }
+}
+
+// ========================================
+
 function loadStats() {
+    if (!fs.existsSync(DATA_DIR)) {
+        try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+    }
+
     if (!fs.existsSync(STATS_FILE)) {
         fs.writeFileSync(STATS_FILE, JSON.stringify({ messages: {}, voice: {}, invites: {}, inviteMap: {}, giveaways: {} }, null, 2));
     }
@@ -149,7 +255,7 @@ async function cacheGuildInvites(guild) {
             new Map(invites.map(inv => [inv.code, { uses: inv.uses ?? 0, inviterId: inv.inviter?.id || null }]))
         );
     } catch (err) {
-        console.warn(`⚠️ [DAVET] ${guild.name} davetleri alınamadı (botta "Sunucuyu Yönet" yetkisi olmalı).`);
+        console.warn(`⚠️ [DAVET] ${guild.name} davetleri alınamadı.`);
     }
 }
 
@@ -228,43 +334,25 @@ function savePrivateRooms() {
     saveStats(s);
 }
 
-// 🔧 ENV öncelikli setup kanal ID'si (Render için)
 function getSetupChannelId() {
     return process.env.SETUP_VOICE_CHANNEL_ID
         || client.setupVoiceChannelId
         || loadStats().setupVoiceChannelId;
 }
 
-
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-    res.send('Bot is running!');
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Web server listening on port ${PORT}`);
-});
-
-
-// 🔧 Özel oda sahibi bulma fonksiyonu (kanal adından + kategori kontrolü)
 function findRoomOwner(guild, channel) {
     if (!channel || !channel.isVoiceBased()) return null;
-    if (!channel.parent || channel.parent.name !== '.') return null; // Sadece "." kategorisindekiler
+    if (!channel.parent || channel.parent.name !== '.') return null;
 
     const username = channel.name.trim();
     if (!username) return null;
 
-    // Tam eşleşme
     let owner = guild.members.cache.find(m =>
         m.user.username.toLowerCase() === username.toLowerCase() ||
         m.user.tag.toLowerCase() === username.toLowerCase() ||
         m.displayName.toLowerCase() === username.toLowerCase()
     );
 
-    // Bulamazsa fuzzy match (başına/sonuna bir şey eklenmiş olabilir)
     if (!owner) {
         owner = guild.members.cache.find(m =>
             channel.name.startsWith(m.user.username) ||
@@ -279,7 +367,6 @@ function parseUserId(input) {
     return String(input || '').replace(/[<@!>]/g, '').trim();
 }
 
-// --- LOG GÖNDERME ---
 async function sendLog(guild, channelEnvName, embed) {
     const channelId = process.env[channelEnvName];
     if (!channelId) return;
@@ -330,7 +417,7 @@ async function checkGuildTag(member) {
                 .setTimestamp();
 
             await sendLog(member.guild, 'LOG_GUILD', tagEmbed);
-            console.log(`[SUNUCU ETİKETİ] ${member.user.tag} etiketi taktı, "${role.name}" rolü verildi.`);
+            console.log(`[SUNUCU ETİKETİ] ${member.user.tag} etiketi taktı.`);
         } catch (err) {
             console.error('Sunucu etiketi rolü verilemedi:', err?.message || err);
         } finally {
@@ -355,7 +442,7 @@ async function checkGuildTag(member) {
                 .setTimestamp();
 
             await sendLog(member.guild, 'LOG_GUILD', untagEmbed);
-            console.log(`[SUNUCU ETİKETİ] ${member.user.tag} etiketi kaldırdı, "${role.name}" rolü alındı.`);
+            console.log(`[SUNUCU ETİKETİ] ${member.user.tag} etiketi kaldırdı.`);
         } catch (err) {
             console.error('Sunucu etiketi rolü alınamadı:', err?.message || err);
         } finally {
@@ -426,6 +513,9 @@ client.once('ready', async () => {
     console.log(`[BAŞARILI] Bot ${client.user.tag} olarak aktifleşti!`);
     console.log(`[BİLGİ] ${client.guilds.cache.size} sunucuda çalışıyorum.`);
 
+    // 📥 GitHub'dan stats.json çek
+    await loadStatsFromGitHub();
+
     for (const guild of client.guilds.cache.values()) {
         await cacheGuildInvites(guild);
     }
@@ -441,7 +531,6 @@ client.once('ready', async () => {
         console.warn('⚠️ [SUNUCU ETİKETİ] .env dosyasında GUILD_TAG_ROLE_ID yok, sistem kapalı.');
     }
 
-    // 🔧 Özel oda setup ID'si yükleme (ENV öncelikli - Render için)
     try {
         if (process.env.SETUP_VOICE_CHANNEL_ID) {
             client.setupVoiceChannelId = process.env.SETUP_VOICE_CHANNEL_ID;
@@ -471,7 +560,6 @@ client.once('ready', async () => {
         console.error('Özel odalar geri yüklenirken hata:', err);
     }
 
-    // 🔍 TÜM SUNUCULARDA ÖZEL ODALARI TARA VE SAHİP ATA
     for (const guild of client.guilds.cache.values()) {
         try {
             const channels = await guild.channels.fetch();
@@ -479,13 +567,13 @@ client.once('ready', async () => {
 
             for (const channel of channels.values()) {
                 if (!channel || !channel.isVoiceBased()) continue;
-                if (privateChannels.has(channel.id)) continue; // Zaten kayıtlı
+                if (privateChannels.has(channel.id)) continue;
 
                 const owner = findRoomOwner(guild, channel);
                 if (owner) {
                     privateChannels.set(channel.id, owner.id);
                     restoredCount++;
-                    console.log(`[ÖZEL ODA] Kanal "${channel.name}" sahibi atandı: ${owner.user.tag} (${owner.id})`);
+                    console.log(`[ÖZEL ODA] Kanal "${channel.name}" sahibi atandı: ${owner.user.tag}`);
                 }
             }
 
@@ -530,6 +618,27 @@ client.once('ready', async () => {
     } catch (error) {
         console.error('Slash komutları yüklenirken hata oluştu:', error);
     }
+
+    // 📤 Her 30 dakikada bir GitHub'a yedekle
+    setInterval(async () => {
+        console.log('[GITHUB] ⏰ Otomatik yedekleme başlıyor...');
+        await saveStatsToGitHub();
+    }, 30 * 60 * 1000);
+
+    // 📤 Bot kapanırken son yedek
+    process.on('SIGTERM', async () => {
+        console.log('[GITHUB] SIGTERM - son yedek alınıyor...');
+        await saveStatsToGitHub();
+        process.exit(0);
+    });
+
+    process.on('SIGINT', async () => {
+        console.log('[GITHUB] SIGINT - son yedek alınıyor...');
+        await saveStatsToGitHub();
+        process.exit(0);
+    });
+
+    console.log('[GITHUB] ✅ Otomatik yedekleme aktif (her 30 dakika bir).');
 });
 
 // --- YETKİ KONTROL ---
@@ -616,7 +725,7 @@ client.on('guildMemberAdd', async (member) => {
     } else if (!welcomeImage) {
         console.warn('⚠️ [KARŞILAMA] .env dosyasında WELCOME_IMAGE_URL yok, mesaj gönderilmedi.');
     } else if (!isValidHttpUrl(welcomeImage)) {
-        console.warn('⚠️ WELCOME_IMAGE_URL geçerli bir link değil (https:// ile başlamalı).');
+        console.warn('⚠️ WELCOME_IMAGE_URL geçerli bir link değil.');
     } else {
         try {
             const welcomeChannel = member.guild.channels.cache.get(welcomeChannelId)
@@ -668,7 +777,7 @@ client.on('guildMemberAdd', async (member) => {
                     embeds: [welcomeEmbed],
                     allowedMentions: { users: [member.id] }
                 });
-                console.log(`[KARŞILAMA] Mesaj #${welcomeChannel.name} kanalına gönderildi. (Invited by: ${inviterName})`);
+                console.log(`[KARŞILAMA] Mesaj #${welcomeChannel.name} kanalına gönderildi.`);
             } else {
                 console.warn('⚠️ WELCOME_CHANNEL_ID ile bir metin kanalı bulunamadı.');
             }
@@ -836,27 +945,25 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         console.error('Ses istatistik hatası:', err);
     }
 
-    // 🔄 Kanala girildiğinde: privateChannels boşsa kanal adından sahibi bul
     if (newState.channelId && !privateChannels.has(newState.channelId)) {
         const channel = newState.guild.channels.cache.get(newState.channelId);
         const owner = findRoomOwner(newState.guild, channel);
         if (owner) {
             privateChannels.set(channel.id, owner.id);
             savePrivateRooms();
-            console.log(`[ÖZEL ODA] Kanal "${channel.name}" sahibi atandı: ${owner.user.tag} (${owner.id})`);
+            console.log(`[ÖZEL ODA] Kanal "${channel.name}" sahibi atandı: ${owner.user.tag}`);
         }
     }
 
     const setupId = getSetupChannelId();
 
-    // Yeni oda açma
     if (setupId && newState.channelId === setupId && oldState.channelId !== setupId) {
         const member = newState.member;
         const guild = newState.guild;
 
         try {
             const createdChannel = await guild.channels.create({
-                name: `${member.user.username}`, // 🎨 Sadece kullanıcı adı
+                name: `${member.user.username}`,
                 type: ChannelType.GuildVoice,
                 parent: newState.channel?.parentId ?? null,
                 permissionOverwrites: [
@@ -881,7 +988,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         }
     }
 
-    // Boşalan odayı sil
     if (oldState.channelId && privateChannels.has(oldState.channelId)) {
         const channel = oldState.guild.channels.cache.get(oldState.channelId);
         if (channel && channel.members.size === 0) {
@@ -909,7 +1015,7 @@ client.on('interactionCreate', async (interaction) => {
             const timeValue = parseInt(durationStr.slice(0, -1));
 
             if (isNaN(timeValue) || !timeMultiplier[unit]) {
-                return interaction.reply({ content: '⚠️ Geçersiz süre biçimi! Örnek kullanım: `30m`, `1h`, `10h`', ephemeral: true });
+                return interaction.reply({ content: '⚠️ Geçersiz süre biçimi! Örnek: `30m`, `1h`, `10h`', ephemeral: true });
             }
 
             const durationMs = timeValue * timeMultiplier[unit];
@@ -1068,7 +1174,7 @@ client.on('interactionCreate', async (interaction) => {
                         embeds: [buildEmbed(0, true, false, null)],
                         components: [buildButtons(true)]
                     }).catch(() => {});
-                    return interaction.channel.send(`⚠️ **${reward}** çekilişine kimse katılmadığı için çekiliş iptal edildi.`);
+                    return interaction.channel.send(`⚠️ **${reward}** çekilişine kimse katılmadığı için iptal edildi.`);
                 }
 
                 const totalParticipants = participantArray.length;
@@ -1101,7 +1207,7 @@ client.on('interactionCreate', async (interaction) => {
                         winners: winners.map(w => w.replace(/[<@!>]/g, ''))
                     };
                     saveStats(stats);
-                    console.log(`[ÇEKİLİŞ] Veri kaydedildi: ${giveawayMsg.id} (${allParticipants.length} katılımcı)`);
+                    console.log(`[ÇEKİLİŞ] Veri kaydedildi: ${giveawayMsg.id}`);
                 } catch (e) {
                     console.error('Çekiliş verisi kaydedilemedi:', e);
                 }
@@ -1187,7 +1293,7 @@ client.on('interactionCreate', async (interaction) => {
 
         if (interaction.customId === 'ticket_close') {
             if (!checkAuth(interaction.member)) {
-                return interaction.reply({ content: '❌ **Bu bileti kapatma yetkiniz yok! Yalnızca yetkililer kapatabilir.**', ephemeral: true });
+                return interaction.reply({ content: '❌ **Bu bileti kapatma yetkiniz yok!**', ephemeral: true });
             }
 
             await interaction.reply({ content: '🔒 Destek talebi 5 saniye içinde kapatılıyor...' });
@@ -1204,11 +1310,9 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ content: '⚠️ Yalnızca kendi özel ses odanızdayken bu paneli kullanabilirsiniz!', ephemeral: true });
         }
 
-        // 🆕 Sahip kontrolü + otomatik algılama
         let ownerId = privateChannels.get(voiceChannel.id);
 
         if (!ownerId) {
-            // Sahip bilinmiyorsa kanal adından bul
             const detectedOwner = findRoomOwner(interaction.guild, voiceChannel);
             if (detectedOwner) {
                 ownerId = detectedOwner.id;
@@ -1218,15 +1322,12 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
 
-        // 🆕 Oda sahibi değilse ama içindeyse ve ismi eşleşiyorsa sahiplenmesine izin ver
         if (ownerId !== interaction.user.id) {
-            // Kullanıcı adı kanal adıyla eşleşiyor mu?
             const isNameMatch = voiceChannel.name.toLowerCase() === interaction.user.username.toLowerCase();
             if (isNameMatch && !ownerId) {
                 privateChannels.set(voiceChannel.id, interaction.user.id);
                 savePrivateRooms();
                 ownerId = interaction.user.id;
-                console.log(`[ÖZEL ODA] Kanal "${voiceChannel.name}" sahibi atandı: ${interaction.user.tag}`);
             } else {
                 return interaction.reply({ content: '⚠️ Yalnızca kendi özel ses odanızdayken bu paneli kullanabilirsiniz!', ephemeral: true });
             }
@@ -1273,7 +1374,7 @@ client.on('interactionCreate', async (interaction) => {
         } catch (err) {
             console.error('Özel oda panel hatası:', err);
             if (!interaction.replied && !interaction.deferred) {
-                return interaction.reply({ content: '❌ İşlem sırasında bir hata oluştu (botun yetkilerini kontrol edin).', ephemeral: true }).catch(() => {});
+                return interaction.reply({ content: '❌ İşlem sırasında bir hata oluştu.', ephemeral: true }).catch(() => {});
             }
         }
     }
@@ -1284,7 +1385,6 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ content: '⚠️ Bu işlem için kendi özel odanızda olmalısınız.', ephemeral: true });
         }
 
-        // 🆕 Sahip kontrolü + otomatik algılama
         let ownerId = privateChannels.get(voiceChannel.id);
         if (!ownerId) {
             const detectedOwner = findRoomOwner(interaction.guild, voiceChannel);
@@ -1328,7 +1428,7 @@ client.on('interactionCreate', async (interaction) => {
                 const target = await interaction.guild.members.fetch(targetId).catch(() => null);
 
                 if (!target) {
-                    return await interaction.reply({ content: '❌ Kullanıcı bulunamadı. Geçerli bir ID veya etiket girin.', ephemeral: true });
+                    return await interaction.reply({ content: '❌ Kullanıcı bulunamadı.', ephemeral: true });
                 }
 
                 if (target.id === interaction.user.id) {
@@ -1375,7 +1475,7 @@ client.on('interactionCreate', async (interaction) => {
         } catch (err) {
             console.error('Modal işleme hatası:', err);
             if (!interaction.replied && !interaction.deferred) {
-                return interaction.reply({ content: '❌ İşlem sırasında bir hata oluştu (botun yetkilerini kontrol edin).', ephemeral: true }).catch(() => {});
+                return interaction.reply({ content: '❌ İşlem sırasında bir hata oluştu.', ephemeral: true }).catch(() => {});
             }
         }
     }
@@ -1439,7 +1539,7 @@ client.on('messageCreate', async (message) => {
 
             try {
                 if (message.member.moderatable) {
-                    await message.member.timeout(MUTE_DURATION, `Komut kanalı spam - ${LIMIT} uyarı`);
+                    await message.member.timeout(MUTE_DURATION, `Komut kanalı spam`);
                 }
             } catch (e) {
                 console.error('Timeout uygulanamadı:', e);
@@ -1459,8 +1559,7 @@ client.on('messageCreate', async (message) => {
                     .addFields(
                         { name: 'Kullanıcı', value: `${message.author} (\`${message.author.id}\`)`, inline: true },
                         { name: 'Kanal', value: `${message.channel}`, inline: true },
-                        { name: 'Süre', value: '`10 dakika`', inline: true },
-                        { name: 'Sebep', value: 'Komut kanalı dışında 30 saniyede 3+ kez bot komutu kullanma', inline: false }
+                        { name: 'Süre', value: '`10 dakika`', inline: true }
                     )
                     .setTimestamp();
 
@@ -1604,7 +1703,7 @@ client.on('messageCreate', async (message) => {
 
         let messageId = args[0];
         if (!messageId) {
-            const warn = await message.reply('⚠️ Kullanım: `.reroll <mesaj_id>`\nÖrnek: `.reroll 1555963799599583386`');
+            const warn = await message.reply('⚠️ Kullanım: `.reroll <mesaj_id>`');
             setTimeout(() => warn.delete().catch(() => {}), 8000);
             return;
         }
@@ -1619,13 +1718,13 @@ client.on('messageCreate', async (message) => {
         const giveawayData = stats.giveaways?.[messageId];
 
         if (!giveawayData) {
-            const warn = await message.reply('❌ Bu ID ile kayıtlı bir çekiliş bulunamadı.\n*(Sadece bu bot ile yapılan ve `.reroll` öncesi biten çekilişler için çalışır.)*');
+            const warn = await message.reply('❌ Bu ID ile kayıtlı bir çekiliş bulunamadı.');
             setTimeout(() => warn.delete().catch(() => {}), 8000);
             return;
         }
 
         if (!giveawayData.participants || giveawayData.participants.length === 0) {
-            const warn = await message.reply('❌ Bu çekilişe katılan kimse yok, yeniden kazanan seçilemez.');
+            const warn = await message.reply('❌ Bu çekilişe katılan kimse yok.');
             setTimeout(() => warn.delete().catch(() => {}), 8000);
             return;
         }
@@ -1683,19 +1782,13 @@ client.on('messageCreate', async (message) => {
         const emojiInputs = args.filter(a => /<(a?):([a-zA-Z0-9_]+):(\d+)>/.test(a));
 
         if (emojiInputs.length === 0) {
-            const warn = await message.reply(
-                '⚠️ **Kullanım:**\n' +
-                '`.emoji-ekle <emoji1> <emoji2> ...`\n\n' +
-                '**Örnekler:**\n' +
-                '• `.emoji-ekle <:a:111> <:b:222> <a:c:333>`\n' +
-                '• Tek seferde 10-20-50 tane ekleyebilirsin'
-            );
+            const warn = await message.reply('⚠️ Kullanım: `.emoji-ekle <emoji1> <emoji2> ...`');
             setTimeout(() => warn.delete().catch(() => {}), 15000);
             return;
         }
 
         if (emojiInputs.length > 50) {
-            const warn = await message.reply(`⚠️ Tek seferde en fazla **50** emoji eklenebilir. (${emojiInputs.length} yazdın)`);
+            const warn = await message.reply(`⚠️ Tek seferde en fazla **50** emoji eklenebilir.`);
             setTimeout(() => warn.delete().catch(() => {}), 8000);
             return;
         }
@@ -1705,7 +1798,7 @@ client.on('messageCreate', async (message) => {
         const availableSlots = maxEmojis - currentEmojis;
 
         if (availableSlots <= 0) {
-            const warn = await message.reply(`❌ Sunucu emoji limiti dolu (${currentEmojis}/${maxEmojis}).`);
+            const warn = await message.reply(`❌ Sunucu emoji limiti dolu.`);
             setTimeout(() => warn.delete().catch(() => {}), 8000);
             return;
         }
@@ -1740,9 +1833,8 @@ client.on('messageCreate', async (message) => {
         const skipped = emojiInputs.length - toProcess.length;
 
         const statusMsg = await message.channel.send(
-            `⏳ **${toProcess.length} emoji** yükleniyor...\n` +
-            (skipped > 0 ? `_(Limit dolduğu için ${skipped} emoji atlanacak)_\n` : '') +
-            `Bu işlem biraz sürebilir, lütfen bekleyin.`
+            `⏳ **${toProcess.length} emoji** yükleniyor...` +
+            (skipped > 0 ? `\n_(Limit dolduğu için ${skipped} emoji atlanacak)_` : '')
         );
 
         const results = { success: [], failed: [] };
@@ -1944,8 +2036,7 @@ client.on('messageCreate', async (message) => {
             console.log(`\n=========================================`);
             console.log(`📌 [ÖZEL ODA] Yeni kurulum kanalı oluşturuldu!`);
             console.log(`   Kanal ID: ${voiceChannel.id}`);
-            console.log(`   Lokal: .env → SETUP_VOICE_CHANNEL_ID=${voiceChannel.id}`);
-            console.log(`   Render: Environment Variables → SETUP_VOICE_CHANNEL_ID = ${voiceChannel.id}`);
+            console.log(`   Render: SETUP_VOICE_CHANNEL_ID = ${voiceChannel.id}`);
             console.log(`=========================================\n`);
 
             const embed = new EmbedBuilder()
@@ -1981,7 +2072,7 @@ client.on('messageCreate', async (message) => {
             return message.channel.send(`✅ Özel ses odası yönetim paneli oluşturuldu!\n\n> 📌 **Kanal ID:** \`${voiceChannel.id}\`\n> Bu ID'yi **Render → Environment Variables → SETUP_VOICE_CHANNEL_ID** olarak eklemeyi unutma!`);
         } catch (err) {
             console.error('Panel kurulum hatası:', err);
-            return message.channel.send('❌ Panel kurulurken hata oluştu. Botun "Kanalları Yönet" yetkisi olduğundan emin olun.');
+            return message.channel.send('❌ Panel kurulurken hata oluştu.');
         }
     }
 
@@ -2001,37 +2092,24 @@ client.on('messageCreate', async (message) => {
             .addFields(
                 {
                     name: '🔧 Aktif Setup Kanalı',
-                    value: channel ? `${channel} (\`${currentId}\`)` : `❌ Bulunamadı (ID: \`${currentId || 'yok'}\`)`,
+                    value: channel ? `${channel} (\`${currentId}\`)` : `❌ Bulunamadı`,
                     inline: false
                 },
                 {
                     name: '📂 ENV (Render)',
-                    value: process.env.SETUP_VOICE_CHANNEL_ID
-                        ? `\`${process.env.SETUP_VOICE_CHANNEL_ID}\``
-                        : '❌ Tanımlı değil',
+                    value: process.env.SETUP_VOICE_CHANNEL_ID ? `\`${process.env.SETUP_VOICE_CHANNEL_ID}\`` : '❌ Yok',
                     inline: true
                 },
                 {
                     name: '💾 stats.json',
-                    value: stats.setupVoiceChannelId
-                        ? `\`${stats.setupVoiceChannelId}\``
-                        : '❌ Kayıtlı değil',
+                    value: stats.setupVoiceChannelId ? `\`${stats.setupVoiceChannelId}\`` : '❌ Yok',
                     inline: true
                 },
                 {
-                    name: '🧠 RAM (client)',
-                    value: client.setupVoiceChannelId
-                        ? `\`${client.setupVoiceChannelId}\``
-                        : '❌ Yok',
+                    name: '🧠 RAM',
+                    value: client.setupVoiceChannelId ? `\`${client.setupVoiceChannelId}\`` : '❌ Yok',
                     inline: true
                 }
-            )
-            .setDescription(
-                '**Nasıl kullanılır?**\n' +
-                '1. `.panel` komutuyla yeni bir setup kanalı oluştur\n' +
-                '2. Botun konsolunda çıkan **Kanal ID**\'yi kopyala\n' +
-                '3. **Render → Environment Variables** → `SETUP_VOICE_CHANNEL_ID` olarak ekle\n' +
-                '4. Deploy et — artık bot yeniden başlasa bile çalışır ✅'
             )
             .setTimestamp();
 
@@ -2085,7 +2163,7 @@ client.on('messageCreate', async (message) => {
 
         const target = message.mentions.members.first() || message.guild.members.cache.get(args[0]);
         if (!target) {
-            return message.reply('⚠️ Lütfen ses kanalınıza çekmek istediğiniz kullanıcıyı etiketleyin veya ID girin. (`.çek @kullanıcı`)');
+            return message.reply('⚠️ Lütfen ses kanalınıza çekmek istediğiniz kullanıcıyı etiketleyin veya ID girin.');
         }
 
         if (target.id === message.author.id) {
@@ -2094,22 +2172,22 @@ client.on('messageCreate', async (message) => {
 
         const authorVoiceChannel = message.member.voice.channel;
         if (!authorVoiceChannel) {
-            return message.reply('⚠️ Kullanıcıyı çekebilmek için önce bir ses kanalında olmalısınız.');
+            return message.reply('⚠️ Önce bir ses kanalında olmalısınız.');
         }
 
         if (!target.voice.channel) {
-            return message.reply('⚠️ Etiketlediğiniz kullanıcı şu anda herhangi bir ses kanalında değil.');
+            return message.reply('⚠️ Kullanıcı ses kanalında değil.');
         }
 
         if (target.voice.channel.id === authorVoiceChannel.id) {
-            return message.reply('⚠️ Etiketlediğiniz kullanıcı zaten sizinle aynı ses kanalında.');
+            return message.reply('⚠️ Kullanıcı zaten aynı ses kanalında.');
         }
 
         try {
             await target.voice.setChannel(authorVoiceChannel);
-            return message.reply(`✅ ${target} kullanıcısı doğrudan **${authorVoiceChannel.name}** kanalına taşındı.`);
+            return message.reply(`✅ ${target} kullanıcısı **${authorVoiceChannel.name}** kanalına taşındı.`);
         } catch (error) {
-            return message.reply('❌ Kullanıcı taşınırken bir hata oluştu (Botun "Üyeleri Taşı" / "Move Members" yetkisinin olduğundan emin olun).');
+            return message.reply('❌ Kullanıcı taşınırken bir hata oluştu.');
         }
     }
 
@@ -2175,7 +2253,7 @@ client.on('messageCreate', async (message) => {
 
         const targetArg = args[0];
         if (!targetArg) {
-            return message.reply('⚠️ Lütfen yasaklanacak kullanıcıyı etiketleyin veya ID yazın. (`.ban @kullanıcı` veya `.ban 123456789012345678`)');
+            return message.reply('⚠️ Lütfen yasaklanacak kullanıcıyı etiketleyin veya ID yazın.');
         }
 
         const targetId = message.mentions.users.first()?.id || targetArg.replace(/[<@!>]/g, '');
@@ -2189,13 +2267,13 @@ client.on('messageCreate', async (message) => {
         try {
             const member = await message.guild.members.fetch(targetId).catch(() => null);
             if (member && !member.bannable) {
-                return message.reply('❌ Bu kullanıcıyı yasaklamak için botun yetkisi yetersiz (Rolü botun üstünde olabilir).');
+                return message.reply('❌ Bu kullanıcıyı yasaklamak için botun yetkisi yetersiz.');
             }
 
             await message.guild.members.ban(targetId, { reason });
-            return message.reply(`✅ **${targetId}** ID'li kullanıcı başarıyla yasaklandı. **Sebep:** ${reason}`);
+            return message.reply(`✅ **${targetId}** ID'li kullanıcı yasaklandı. **Sebep:** ${reason}`);
         } catch (error) {
-            return message.reply('❌ Kullanıcı yasaklanırken bir hata oluştu (ID hatalı olabilir veya botun ban yetkisi yok).');
+            return message.reply('❌ Kullanıcı yasaklanırken bir hata oluştu.');
         }
     }
 
@@ -2206,14 +2284,14 @@ client.on('messageCreate', async (message) => {
 
         const targetArg = args[0];
         if (!targetArg) {
-            return message.reply('⚠️ Lütfen atılacak kullanıcıyı etiketleyin veya ID yazın. (`.kick @kullanıcı` veya `.kick 123456789012345678`)');
+            return message.reply('⚠️ Lütfen atılacak kullanıcıyı etiketleyin veya ID yazın.');
         }
 
         const targetId = message.mentions.members.first()?.id || targetArg.replace(/[<@!>]/g, '');
         const target = await message.guild.members.fetch(targetId).catch(() => null);
 
         if (!target) {
-            return message.reply('❌ Belirtilen ID veya etikete sahip kullanıcı sunucuda bulunamadı.');
+            return message.reply('❌ Kullanıcı sunucuda bulunamadı.');
         }
 
         if (target.id === message.author.id) {
@@ -2221,14 +2299,14 @@ client.on('messageCreate', async (message) => {
         }
 
         if (!target.kickable) {
-            return message.reply('❌ Bu kullanıcıyı atmak için botun yetkisi yetersiz (Rolü botun üstünde olabilir).');
+            return message.reply('❌ Bu kullanıcıyı atmak için botun yetkisi yetersiz.');
         }
 
         const reason = args.slice(1).join(' ') || 'Sebep belirtilmedi.';
 
         try {
             await target.kick(reason);
-            return message.reply(`✅ **${target.user.tag}** (${target.id}) sunucudan atıldı. **Sebep:** ${reason}`);
+            return message.reply(`✅ **${target.user.tag}** sunucudan atıldı. **Sebep:** ${reason}`);
         } catch (error) {
             return message.reply('❌ Kullanıcı atılırken bir hata oluştu.');
         }
